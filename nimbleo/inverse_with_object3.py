@@ -1,0 +1,231 @@
+import RPi.GPIO as GPIO
+import pigpio
+import time
+import math
+import cv2
+import numpy as np
+
+# Suppress GPIO warnings
+GPIO.setwarnings(False)
+
+# === Stepper Motor Setup ===
+STEP_PIN = 21
+DIR_PIN = 20
+LIMIT_SWITCH_PIN = 6
+STEPS_PER_REV = 200  # 200 steps for one full revolution
+MAX_ANGLE = 100  # Maximum allowed movement in degrees from the current position
+current_position = 0  # Tracks current position in degrees
+
+# Setup GPIO for stepper motor
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(STEP_PIN, GPIO.OUT)
+GPIO.setup(DIR_PIN, GPIO.OUT)
+GPIO.setup(LIMIT_SWITCH_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+# === Servo Motor Setup ===
+pi = pigpio.pi()
+servo_pins = [22, 23, 24]  # GPIO pins for the 3 servos
+servo_current_angles = [0, 0, 0]  # Store the current angle of each servo
+
+# === Robotic Arm Link Lengths ===
+L1 = 52  # Base to shoulder
+L2 = 140  # Shoulder to elbow
+L3 = 140  # Elbow to wrist
+
+# Function to convert degrees to radians
+def deg_to_rad(deg):
+    return deg * (math.pi / 180.0)
+
+# Function to compute forward kinematics
+def forward_kinematics(theta1, theta2, theta3, theta4):
+    theta1_rad = deg_to_rad(theta1)
+    theta2_rad = deg_to_rad(theta2)
+    theta3_rad = deg_to_rad(theta3)
+    theta4_rad = deg_to_rad(theta4)
+
+    shoulder_x = L1 * math.cos(theta1_rad)
+    shoulder_y = L1 * math.sin(theta1_rad)
+    shoulder_z = L1  # Base height assumed along z-axis
+
+    elbow_x = shoulder_x + L2 * math.cos(theta2_rad) * math.cos(theta1_rad)
+    elbow_y = shoulder_y + L2 * math.cos(theta2_rad) * math.sin(theta1_rad)
+    elbow_z = shoulder_z + L2 * math.sin(theta2_rad)
+
+    wrist_x = elbow_x + L3 * math.cos(theta3_rad) * math.cos(theta1_rad)
+    wrist_y = elbow_y + L3 * math.cos(theta3_rad) * math.sin(theta1_rad)
+    wrist_z = elbow_z + L3 * math.sin(theta3_rad)
+
+    return wrist_x, wrist_y, wrist_z
+
+# Function to compute inverse kinematics
+def inverse_kinematics(x, y, z):
+    theta1 = math.atan2(y, x) * (180.0 / math.pi)  # Base angle (theta1)
+
+    wrist_z = z - L1
+    wrist_xy = math.sqrt(x**2 + y**2)
+    wrist_dist = math.sqrt(wrist_xy**2 + wrist_z**2)
+
+    if wrist_dist > (L2 + L3):
+        print("Position out of reach.")
+        return None
+
+    cos_angle2 = (L2**2 + wrist_dist**2 - L3**2) / (2 * L2 * wrist_dist)
+    sin_angle2 = math.sqrt(1 - cos_angle2**2)
+    theta2 = math.atan2(wrist_z, wrist_xy) + math.atan2(sin_angle2, cos_angle2)
+
+    cos_angle3 = (L2**2 + L3**2 - wrist_dist**2) / (2 * L2 * L3)
+    sin_angle3 = math.sqrt(1 - cos_angle3**2)
+    theta3 = math.atan2(sin_angle3, cos_angle3)
+
+    theta2 = theta2 * (180.0 / math.pi)
+    theta3 = theta3 * (180.0 / math.pi)
+    theta4 = 0  # No wrist rotation
+
+    return theta1, theta2, theta3, theta4
+
+# Function to move servos smoothly
+def set_servo_angle_slow(pin, start_angle, end_angle, step_delay=0.05):
+    step = 1 if start_angle < end_angle else -1
+    for angle in range(int(start_angle), int(end_angle), step):
+        pulse_width = int(500 + (angle / 180.0) * 2000)
+        pi.set_servo_pulsewidth(pin, pulse_width)
+        time.sleep(step_delay)
+    pulse_width = int(500 + (end_angle / 180.0) * 2000)
+    pi.set_servo_pulsewidth(pin, pulse_width)
+
+# Stepper motor calibration
+def calibrate_stepper():
+    global current_position, servo_current_angles
+    print("Calibrating stepper motor...")
+
+    GPIO.output(DIR_PIN, GPIO.LOW)
+    while GPIO.input(LIMIT_SWITCH_PIN) == GPIO.HIGH:
+        GPIO.output(STEP_PIN, GPIO.HIGH)
+        time.sleep(0.01)
+        GPIO.output(STEP_PIN, GPIO.LOW)
+        time.sleep(0.01)
+    current_position = 0
+    print("Calibration complete. 0-degree position set.")
+
+    for i in range(len(servo_pins)):
+        set_servo_angle_slow(servo_pins[i], servo_current_angles[i], 0)
+        servo_current_angles[i] = 0
+
+# Move stepper motor to target angle
+def move_stepper(target_angle):
+    global current_position
+    min_allowed_angle = current_position - MAX_ANGLE
+    max_allowed_angle = current_position + MAX_ANGLE
+
+    if target_angle < min_allowed_angle:
+        target_angle = min_allowed_angle
+    elif target_angle > max_allowed_angle:
+        target_angle = max_allowed_angle
+
+    angle_to_move = target_angle - current_position
+    steps = int((STEPS_PER_REV * abs(angle_to_move)) / 360)
+
+    if angle_to_move > 0:
+        GPIO.output(DIR_PIN, GPIO.HIGH)
+    else:
+        GPIO.output(DIR_PIN, GPIO.LOW)
+
+    for _ in range(steps):
+        GPIO.output(STEP_PIN, GPIO.HIGH)
+        time.sleep(0.01)
+        GPIO.output(STEP_PIN, GPIO.LOW)
+        time.sleep(0.01)
+
+    current_position = target_angle
+    print(f"Stepper moved to: {current_position} degrees")
+
+# === Camera Initialization ===
+cap = cv2.VideoCapture(0)  # Adjust index if necessary
+
+# Set minimum area threshold to avoid detecting small objects
+min_area_threshold = 500  # Adjust as needed
+scaling_factor = 0.512
+x_offset = -70.0
+y_offset = 35.14
+paused = False
+adjusted_coordinates = None
+
+def capture_frame(frame):
+    cv2.imwrite('captured_frame.png', frame)
+    print("Frame captured and saved as 'captured_frame.png'.")
+
+def resume_video():
+    global paused
+    paused = False
+    print("Resuming video feed...")
+
+# === Main Program ===
+try:
+    home_position = [0, 150, 180, 0]
+    calibrate_stepper()
+
+    while True:
+        if not paused:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to grab frame.")
+                break
+
+            frame_height, frame_width, _ = frame.shape
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+            lower_red1 = np.array([0, 100, 100])
+            upper_red1 = np.array([10, 255, 255])
+            lower_red2 = np.array([160, 100, 100])
+            upper_red2 = np.array([180, 255, 255])
+
+            mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+            mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+            mask = mask1 | mask2
+
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area > min_area_threshold:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    center_x = frame_width - (x + w // 2)
+                    center_y = frame_height - (y + h // 2)
+                    scaled_x = (center_x * scaling_factor) - x_offset
+                    scaled_y = (center_y * scaling_factor) - y_offset
+                    adjusted_coordinates = (scaled_y, scaled_x)
+
+                    print(f"Adjusted Coordinates for Robotic Arm - Y: {adjusted_coordinates[0]}, X: {adjusted_coordinates[1]}")
+                    joint_angles = inverse_kinematics(adjusted_coordinates[1], adjusted_coordinates[0], 0)
+                    
+                    if joint_angles:
+                        base_angle, shoulder_angle, elbow_angle, wrist_angle = joint_angles
+                        move_stepper(base_angle)
+                        set_servo_angle_slow(servo_pins[0], servo_current_angles[0], shoulder_angle)
+                        set_servo_angle_slow(servo_pins[1], servo_current_angles[1], elbow_angle)
+                        set_servo_angle_slow(servo_pins[2], servo_current_angles[2], wrist_angle)
+                        servo_current_angles = [shoulder_angle, elbow_angle, wrist_angle]
+                    else:
+                        print("Target out of reach.")
+
+                    capture_frame(frame)
+                    paused = True
+                    break
+
+            cv2.imshow("Masked Video", mask)
+
+        key = cv2.waitKey(1)
+        if key == ord("q"):
+            print("Exiting program.")
+            break
+        elif key == ord("c"):
+            capture_frame(frame)
+        elif key == ord("r"):
+            resume_video()
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    GPIO.cleanup()
+    for pin in servo_pins:
+        pi.set_servo_pulsewidth(pin, 0)
+    print("Stepper and servos turned off. Exiting.")
